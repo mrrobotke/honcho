@@ -11,6 +11,7 @@ Covers:
 
 import json
 import logging
+import queue
 import threading
 import time
 from pathlib import Path
@@ -565,6 +566,112 @@ class TestAsyncWriterRetry:
 
         mgr.shutdown()
         assert call_count[0] == 2
+
+
+class _RecordingQueue(queue.Queue):
+    """Records the timeout of every blocking get()."""
+
+    def __init__(self):
+        super().__init__()
+        self.get_timeouts = []
+
+    def get(self, block=True, timeout=None):
+        if block:
+            self.get_timeouts.append(timeout)
+        return super().get(block, timeout)
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached in time"
+        time.sleep(0.01)
+
+
+class TestAsyncWriterWaitAndExit:
+    """The writer waits for work without waking up, and every stop path delivers the sentinel it exits on."""
+
+    def _recording_flush(self, mgr, gates=None):
+        """Replace the upload with one that records the session key once it returns. A key in ``gates`` blocks
+        until its event is set; ``entered`` tells when that upload began."""
+        gates = gates or {}
+        flushed, entered = [], threading.Event()
+
+        def flush(session):
+            if session.key in gates:
+                entered.set()
+                assert gates[session.key].wait(timeout=10), "test never released the upload"
+            flushed.append(session.key)
+            return True
+
+        mgr._flush_session = flush
+        return flushed, entered
+
+    def test_saves_are_written_in_fifo_order(self, make_manager):
+        mgr = make_manager("async")
+        flushed, _ = self._recording_flush(mgr)
+
+        for n in range(5):
+            mgr.save(_make_session(key=f"s{n}", honcho_session_id=f"s{n}"))
+
+        _wait_until(lambda: len(flushed) == 5)
+        assert flushed == ["s0", "s1", "s2", "s3", "s4"]
+
+    def test_an_idle_writer_waits_without_a_timeout(self, make_manager):
+        mgr = make_manager("async")
+        mgr._async_queue = recording = _RecordingQueue()
+        flushed, _ = self._recording_flush(mgr)
+
+        mgr.save(_make_session(key="s0"))
+        _wait_until(lambda: flushed == ["s0"] and len(recording.get_timeouts) == 2)
+
+        # A timed get() is a periodic wake-up while idle; an untimed one blocks until the next item.
+        assert recording.get_timeouts == [None, None]
+
+    def test_stopping_an_idle_writer_is_prompt(self, make_manager):
+        mgr = make_manager("async")
+        flushed, _ = self._recording_flush(mgr)
+        mgr.save(_make_session(key="s0"))
+        _wait_until(lambda: flushed == ["s0"])
+
+        started = time.monotonic()
+        mgr.stop_async_writer(timeout=10)
+
+        assert time.monotonic() - started < 1.0
+        assert not mgr._async_thread.is_alive()
+
+    @pytest.mark.parametrize("stop", ["stop_async_writer", "shutdown"])
+    def test_a_writer_still_uploading_after_the_join_exits_when_the_upload_returns(self, make_manager, stop):
+        """The join times out while the writer is inside an upload, and the drain after it takes the shutdown
+        sentinel off the queue. The writer must still receive the sentinel once the upload returns."""
+        mgr = make_manager("async")
+        release = threading.Event()
+        flushed, entered = self._recording_flush(mgr, gates={"s0": release})
+        mgr.save(_make_session(key="s0"))
+        assert entered.wait(timeout=5), "async writer never started the upload"
+
+        getattr(mgr, stop)(timeout=0.2)
+        assert mgr._async_thread.is_alive()
+        release.set()
+
+        mgr._async_thread.join(timeout=2)
+        assert not mgr._async_thread.is_alive()
+        assert flushed == ["s0"]
+
+    def test_shutdown_flushes_sessions_queued_behind_a_busy_writer_in_order(self, make_manager):
+        mgr = make_manager("async")
+        release = threading.Event()
+        flushed, entered = self._recording_flush(mgr, gates={"s0": release})
+        mgr.save(_make_session(key="s0"))
+        assert entered.wait(timeout=5), "async writer never started the upload"
+        mgr.save(_make_session(key="s1"))
+        mgr.save(_make_session(key="s2"))
+        threading.Timer(0.5, release.set).start()
+
+        mgr.shutdown(timeout=5)
+
+        assert flushed == ["s1", "s2", "s0"]
+        assert not mgr._async_thread.is_alive()
 
 
 def _prime_migration_session(mgr, key, honcho_session_id, ai_peer_id="custom-ai"):
