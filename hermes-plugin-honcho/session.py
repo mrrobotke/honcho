@@ -475,10 +475,11 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
         return False
 
     def _async_writer_loop(self) -> None:
-        """Background daemon thread: drains the async write queue, retrying each batch once."""
+        """Background daemon thread: drains the async write queue, retrying each batch once. It blocks while idle
+        and exits only on _ASYNC_SHUTDOWN, which _drain_async_queue hands back whenever it takes it."""
         while True:
             try:
-                item = self._async_queue.get(timeout=5)
+                item = self._async_queue.get()
                 if item is _ASYNC_SHUTDOWN:
                     break
                 if not self._try_flush(item, logging.WARNING, "Honcho async write failed, retrying once"):
@@ -488,8 +489,6 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                         continue
                     time.sleep(2)
                     self._try_flush(item, logging.ERROR, "Honcho async write retry failed, dropping batch")
-            except queue.Empty:
-                continue
             except Exception as e:
                 logger.error("Honcho async writer error: %s", e)
 
@@ -573,17 +572,23 @@ class HonchoSessionManager(SessionAuthMixin, SessionPeersMixin, SessionContextMi
                            timeout or 0.0, unsynced, len(left))
 
     def _drain_async_queue(self, deadline: float | None = None) -> list[HonchoSession]:
-        """Flush every queued session inline. Returns the sessions ``deadline`` left unflushed."""
+        """Flush every queued session inline. Returns the sessions ``deadline`` left unflushed. A shutdown sentinel
+        taken here goes back on the queue: a writer still inside an upload past the join needs it to exit."""
         skipped: list[HonchoSession] = []
         if self._async_queue is None:
             return skipped
+        took_shutdown = False
         while not self._async_queue.empty():
             try:
                 item = self._async_queue.get_nowait()
             except queue.Empty:
                 break
-            if item is not _ASYNC_SHUTDOWN and not self._flush_session_before(item, deadline):
+            if item is _ASYNC_SHUTDOWN:
+                took_shutdown = True
+            elif not self._flush_session_before(item, deadline):
                 skipped.append(item)
+        if took_shutdown:
+            self._async_queue.put(_ASYNC_SHUTDOWN)
         return skipped
 
     def _ensure_async_writer_locked(self) -> None:
